@@ -1,0 +1,556 @@
+---
+title: "Week 3 Task: Statistical Analysis and Predictive Modeling using R"
+subtitle: "Predicting passenger survival on the Titanic with logistic regression"
+author: "[Your Name] | [Internship / Organisation] | [Date]"
+output:
+  word_document:
+    fig_width: 6.5
+    fig_height: 4
+    fig_caption: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      comment = "#>", dpi = 200)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(pROC)
+library(randomForest)
+library(car)
+
+col_no  <- "#D55E00"
+col_yes <- "#0072B2"
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 11.5),
+          plot.subtitle = element_text(colour = "grey35"),
+          panel.grid.minor = element_blank())
+)
+```
+
+# 1. Objective and Approach
+
+The goal of this task is to carry out a structured statistical analysis and build a predictive model in R, following this sequence:
+
+1. Choose a dataset and justify the choice.
+2. Examine distributions and test statistical assumptions (normality, correlation).
+3. Formulate and test hypotheses.
+4. Build a classification model, validated with a train/test split and cross-validation.
+5. Diagnose the model, interpret its performance, and identify improvements.
+
+**Prediction question:** *Given what is known about a passenger (class, sex, age, family, fare, port, cabin record), can we predict whether they survived, and which factors drive that prediction?*
+
+## 1.1 Dataset and rationale
+
+The dataset is the Titanic passenger data (891 passengers), in the cleaned form produced in Week 1. It was chosen because:
+
+- **It suits classification.** The outcome (`Survived`: yes/no) is binary, with a reasonably balanced split (about 38% vs 62%), so accuracy alone is not misleading.
+- **It mixes variable types**, which allows a range of statistical tests: categorical versus categorical (chi-square), numeric versus categorical (t-test, Wilcoxon), and numeric versus numeric (correlation).
+- **It has known quirks to test assumptions on**: skewed variables (`Fare`), imputed values (`Age`) and correlated predictors (`Pclass` and `Fare`).
+- **Continuity.** The data was already cleaned and explored in Weeks 1 and 2, so this week can focus on inference and modeling rather than repeating cleaning.
+
+A limitation worth stating up front: 891 rows is small for modeling, so performance estimates will carry noticeable uncertainty. This is addressed by using cross-validation and reporting confidence intervals.
+
+## 1.2 Loading and preparing the data
+
+```{r load}
+df <- read.csv("titanic_clean.csv", stringsAsFactors = FALSE)
+
+df$Survived <- factor(df$Survived, levels = c("No", "Yes"))
+df$Pclass   <- factor(df$Pclass, levels = 1:3, labels = c("1st", "2nd", "3rd"))
+df$Sex      <- factor(df$Sex, levels = c("female", "male"))
+df$Embarked <- factor(df$Embarked)
+
+dim(df)
+table(df$Survived)
+round(100 * prop.table(table(df$Survived)), 1)
+```
+
+The variables used for modeling are listed below. `Fare_log` (the log of fare, created in Week 1) is used instead of raw `Fare` because of the heavy right skew.
+
+```{r model-data}
+model_df <- df %>%
+  select(Survived, Pclass, Sex, Age, SibSp, Parch, Fare_log, Embarked, HasCabin)
+
+str(model_df)
+colSums(is.na(model_df))
+```
+
+There are no missing values. One caveat is that `Age` was imputed in Week 1 using medians computed on the **whole** dataset before any train/test split. This used no outcome information, so the risk of leakage is small, but a stricter pipeline would impute inside each cross-validation fold (see Section 7).
+
+# 2. Exploratory Statistical Analysis
+
+## 2.1 Distributions and normality
+
+Many classical tests assume approximately normal data, so normality is checked first for the three continuous variables.
+
+```{r normality}
+skewness <- function(x) mean((x - mean(x))^3) / sd(x)^3
+
+norm_tbl <- data.frame(
+  variable = c("Age", "Fare", "Fare_log"),
+  skewness = round(c(skewness(df$Age), skewness(df$Fare), skewness(df$Fare_log)), 2),
+  shapiro_W = round(c(shapiro.test(df$Age)$statistic,
+                      shapiro.test(df$Fare)$statistic,
+                      shapiro.test(df$Fare_log)$statistic), 3),
+  shapiro_p = format.pval(c(shapiro.test(df$Age)$p.value,
+                            shapiro.test(df$Fare)$p.value,
+                            shapiro.test(df$Fare_log)$p.value), digits = 3)
+)
+norm_tbl
+```
+
+```{r qq, fig.cap="Figure 1: Normal Q-Q plots. Points close to the line indicate normality.", fig.height=3.2}
+qq_plot <- function(x, name) {
+  ggplot(data.frame(x = x), aes(sample = x)) +
+    stat_qq(size = 0.7, colour = col_yes, alpha = 0.6) +
+    stat_qq_line(colour = col_no) +
+    labs(title = name, x = "Theoretical quantiles", y = "Sample quantiles")
+}
+qq_plot(df$Age, "Age") + qq_plot(df$Fare, "Fare") + qq_plot(df$Fare_log, "Fare (log)")
+```
+
+**Interpretation.** The Shapiro-Wilk test rejects normality for all three variables (p < 0.001), but with 891 observations this test flags even small departures, so the Q-Q plots and skewness are more informative. `Age` (skewness 0.47) follows the line through the middle but curves away at both ends and shows step-like clusters, partly from the ages imputed in Week 1. `Fare` is severely non-normal (skewness 4.77), with points curving far above the line. The log transform cuts the skewness to 0.39, but `Fare_log` still shows steps and a flat floor, because many passengers paid identical ticket prices and 15 paid nothing.
+
+**Decision.** None of the three variables is normal, so rank-based (non-parametric) tests are used for `Fare`, and for `Age` as a cross-check on the t-test. Logistic regression itself does not require normally distributed predictors; its assumptions are independent observations, a linear relationship between each numeric predictor and the log-odds, and no severe multicollinearity. Those are checked in Section 5.
+
+## 2.2 Hypothesis tests
+
+All tests use a significance level of **alpha = 0.05**. Because six primary tests are run, p-values are also adjusted with the **Holm** method to control the chance of a false positive across the family of tests.
+
+| # | Question | H0 (null) | H1 (alternative) | Test chosen and why |
+|---|---|---|---|---|
+| 1 | Does sex affect survival? | Sex and survival are independent | They are associated | Chi-square: two categorical variables |
+| 2 | Does ticket class affect survival? | Class and survival are independent | They are associated | Chi-square: two categorical variables |
+| 3 | Does age differ between survivors and non-survivors? | Mean ages are equal | Mean ages differ | Welch t-test (unequal variances), checked with Wilcoxon because age is not normal |
+| 4 | Does fare differ between survivors and non-survivors? | Fare distributions are equal | They differ | Wilcoxon rank-sum: fare is heavily skewed |
+| 5 | Does age differ across the three classes? | Age distributions are equal | At least one class differs | Kruskal-Wallis: three groups, non-normal data |
+| 6 | Are age and fare correlated? | Spearman rho = 0 | rho is not 0 | Spearman: rank-based, robust to skew |
+
+### Test 1: Sex and survival
+
+```{r test1}
+tab_sex <- table(df$Sex, df$Survived)
+tab_sex
+t1 <- chisq.test(tab_sex)
+t1
+t1$expected   # assumption check: all expected counts should be >= 5
+
+# Effect sizes: Cramer's V and odds ratio
+cramers_v <- function(tab) {
+  chi <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+  as.numeric(sqrt(chi / (sum(tab) * (min(dim(tab)) - 1))))
+}
+round(cramers_v(tab_sex), 3)
+# Odds ratio: odds of SURVIVING for women relative to men
+ft <- fisher.test(tab_sex)
+round(c(OR = 1 / unname(ft$estimate), lower = 1 / ft$conf.int[2], upper = 1 / ft$conf.int[1]), 1)
+```
+
+### Test 2: Class and survival
+
+```{r test2}
+tab_cls <- table(df$Pclass, df$Survived)
+tab_cls
+t2 <- chisq.test(tab_cls)
+t2
+round(cramers_v(tab_cls), 3)
+```
+
+### Test 3: Age and survival
+
+```{r test3}
+t3 <- t.test(Age ~ Survived, data = df)       # Welch t-test
+t3
+w3 <- wilcox.test(Age ~ Survived, data = df, conf.int = TRUE)
+w3
+
+# Cohen's d (effect size)
+cohen_d <- function(x, g) {
+  a <- x[g == levels(g)[1]]; b <- x[g == levels(g)[2]]
+  sp <- sqrt(((length(a) - 1) * var(a) + (length(b) - 1) * var(b)) /
+               (length(a) + length(b) - 2))
+  (mean(b) - mean(a)) / sp
+}
+round(cohen_d(df$Age, df$Survived), 3)
+```
+
+### Test 4: Fare and survival
+
+```{r test4}
+t4 <- wilcox.test(Fare ~ Survived, data = df)
+t4
+tapply(df$Fare, df$Survived, median)
+
+# Common-language effect size: P(random survivor paid more than random non-survivor)
+n_no <- sum(df$Survived == "No"); n_yes <- sum(df$Survived == "Yes")
+round(1 - unname(t4$statistic) / (n_no * n_yes), 3)
+```
+
+### Test 5: Age across classes
+
+```{r test5}
+t5 <- kruskal.test(Age ~ Pclass, data = df)
+t5
+# Post-hoc pairwise comparisons with Holm correction
+pairwise.wilcox.test(df$Age, df$Pclass, p.adjust.method = "holm")
+```
+
+### Test 6: Correlation between age and fare
+
+```{r test6}
+t6 <- cor.test(df$Age, df$Fare, method = "spearman", exact = FALSE)
+t6
+
+# Full Spearman correlation matrix of numeric predictors
+num_cols <- df %>% select(Age, SibSp, Parch, Fare_log, Survived) %>% mutate(Survived = as.integer(Survived == "Yes"))
+round(cor(num_cols, method = "spearman"), 2)
+```
+
+### Summary of hypothesis tests
+
+```{r test-summary}
+p_raw <- c(t1$p.value, t2$p.value, t3$p.value, t4$p.value, t5$p.value, t6$p.value)
+test_summary <- data.frame(
+  test = c("1. Sex vs survival (chi-square)",
+           "2. Class vs survival (chi-square)",
+           "3. Age by survival (Welch t-test)",
+           "4. Fare by survival (Wilcoxon)",
+           "5. Age by class (Kruskal-Wallis)",
+           "6. Age vs fare (Spearman)"),
+  p_value  = format.pval(p_raw, digits = 3),
+  p_holm   = format.pval(p.adjust(p_raw, method = "holm"), digits = 3),
+  decision = ifelse(p.adjust(p_raw, method = "holm") < 0.05,
+                    "Reject H0", "Fail to reject H0")
+)
+test_summary
+```
+
+**Interpretation of the tests**
+
+1. **Sex and survival (reject H0).** The association is very strong (chi-square = 260.7, df = 1, p < 0.001). Cramer's V is 0.54, a large effect. Women survived at 74% (233 of 314) versus 19% (109 of 577) for men; the odds of survival for women were about 12 times those for men (odds ratio 12.3, 95% CI 8.8 to 17.4). All expected cell counts exceed 5, so the chi-square assumption holds.
+2. **Class and survival (reject H0).** Survival fell from 63% in first class to 47% in second and 24% in third (chi-square = 102.9, df = 2, p < 0.001, Cramer's V = 0.34, a medium-to-large effect).
+3. **Age and survival (fail to reject H0).** Mean age was 29.8 for non-survivors and 28.1 for survivors; the Welch t-test (p = 0.067) and the Wilcoxon test (p = 0.216) both fall short of significance, and Cohen's d is small (-0.13). **This does not prove age is irrelevant.** Week 2 showed that age matters mainly for young boys and differs by sex, so a simple comparison of average ages can hide those patterns. The model in Section 3 tests age while controlling for the other variables.
+4. **Fare and survival (reject H0).** Median fare was 26.0 for survivors versus 10.5 for non-survivors (p < 0.001). There is a 69% chance that a randomly chosen survivor paid more than a randomly chosen non-survivor.
+5. **Age across classes (reject H0).** Age differs by class (Kruskal-Wallis chi-square = 156.0, p < 0.001), and all three pairwise comparisons remain significant after Holm correction (largest adjusted p = 5.5e-08), matching the rising median age by class seen in Week 2.
+6. **Age and fare (reject H0, but weak).** Spearman's rho is 0.17 (p < 0.001). The correlation is statistically significant but small: age explains only about 3% of the variation in fare ranks (rho squared = 0.03). The matrix also shows moderate correlations among the family and fare variables (for example, SibSp with Parch 0.45, Fare_log with SibSp 0.45), which is relevant for multicollinearity later.
+
+**Multiple testing.** After Holm adjustment, the decisions for all six tests are unchanged. **Statistical versus practical significance:** with 891 passengers even small effects can reach p < 0.001, so the effect sizes (Cramer's V, Cohen's d, rho) matter as much as the p-values.
+
+# 3. Model Building
+
+## 3.1 Train/test split
+
+The data is split 80/20 into a **training set** (used for all model fitting and selection) and a **test set** (touched only once, at the end, to give an honest estimate of performance on unseen data). The split is **stratified** by outcome so both sets keep the same survival rate.
+
+```{r split}
+set.seed(2026)
+idx <- unlist(lapply(split(seq_len(nrow(model_df)), model_df$Survived),
+                     function(i) sample(i, size = round(0.8 * length(i)))))
+train <- model_df[idx, ]
+test  <- model_df[-idx, ]
+
+c(train = nrow(train), test = nrow(test))
+round(100 * prop.table(table(train$Survived)), 1)
+round(100 * prop.table(table(test$Survived)), 1)
+```
+
+## 3.2 Candidate models
+
+Logistic regression is the primary model: it is well suited to a yes/no outcome and its coefficients can be interpreted as odds ratios, which matters for explaining results to non-technical readers. Four candidates are compared:
+
+- **Baseline:** always predict the majority class ("No"). Any useful model must beat this.
+- **Model 1:** logistic regression with main effects of all predictors.
+- **Model 2:** Model 1 plus a **Sex x Class interaction**, motivated by Week 2, which suggested the effect of class differs between men and women.
+- **Random forest:** a flexible, non-linear model used as a benchmark to check whether logistic regression is leaving signal on the table.
+
+```{r formulas}
+f1 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare_log + Embarked + HasCabin
+f2 <- update(f1, . ~ . + Sex:Pclass)
+
+# Baseline: majority-class accuracy on the training set
+max(prop.table(table(train$Survived)))
+```
+
+## 3.3 Cross-validation
+
+Models are compared using **repeated stratified 10-fold cross-validation on the training set only**. The data is divided into 10 folds; each fold in turn is held out while the model is fitted on the other nine, and performance is measured on the held-out fold. This is repeated three times with different random fold assignments to make the estimate more stable. The two metrics are accuracy (at a 0.5 threshold) and **AUC**, which measures how well the model ranks survivors above non-survivors regardless of threshold.
+
+```{r cv-functions}
+auc_fn <- function(y, p) {
+  as.numeric(auc(roc(y, p, levels = c("No", "Yes"), direction = "<", quiet = TRUE)))
+}
+
+fit_predict <- function(type, formula, trn, tst) {
+  if (type == "glm") {
+    m <- glm(formula, data = trn, family = binomial)
+    predict(m, newdata = tst, type = "response")
+  } else {
+    m <- randomForest(formula, data = trn, ntree = 500)
+    predict(m, newdata = tst, type = "prob")[, "Yes"]
+  }
+}
+
+cv_eval <- function(type, formula, data, k = 10, reps = 3, seed = 2026) {
+  set.seed(seed)
+  out <- vector("list", k * reps); n <- 0
+  for (r in seq_len(reps)) {
+    folds <- integer(nrow(data))
+    for (cl in levels(data$Survived)) {                 # stratified fold assignment
+      ii <- which(data$Survived == cl)
+      folds[ii] <- sample(rep(seq_len(k), length.out = length(ii)))
+    }
+    for (f in seq_len(k)) {
+      trn <- data[folds != f, ]; tst <- data[folds == f, ]
+      p <- fit_predict(type, formula, trn, tst)
+      n <- n + 1
+      out[[n]] <- data.frame(auc = auc_fn(tst$Survived, p),
+                             acc = mean((p >= 0.5) == (tst$Survived == "Yes")))
+    }
+  }
+  bind_rows(out)
+}
+```
+
+```{r cv-run, cache=FALSE}
+cv_res <- list(
+  "Model 1: logistic (main effects)"        = cv_eval("glm", f1, train),
+  "Model 2: logistic (+ Sex x Class)"       = cv_eval("glm", f2, train),
+  "Random forest (benchmark)"               = cv_eval("rf",  f1, train)
+)
+
+cv_tbl <- bind_rows(lapply(names(cv_res), function(nm) {
+  r <- cv_res[[nm]]
+  data.frame(model = nm,
+             auc_mean = round(mean(r$auc), 3), auc_sd = round(sd(r$auc), 3),
+             acc_mean = round(mean(r$acc), 3), acc_sd = round(sd(r$acc), 3))
+}))
+cv_tbl
+```
+
+Is the interaction term justified? A likelihood-ratio test on the training data compares the two logistic models directly:
+
+```{r lrt}
+m1_tr <- glm(f1, data = train, family = binomial)
+m2_tr <- glm(f2, data = train, family = binomial)
+anova(m1_tr, m2_tr, test = "Chisq")
+AIC(m1_tr, m2_tr)
+```
+
+**Model choice.** The three models score very similarly in cross-validation (AUC 0.865, 0.869 and 0.877). Differences of about 0.01 are small compared with the fold-to-fold variation (standard deviation about 0.05), so cross-validation alone cannot clearly separate them. **Model 2 (logistic regression with the Sex x Class interaction) is chosen as the final model** for three reasons, all based on training-set evidence:
+
+1. The interaction is strongly supported: the likelihood-ratio test gives a deviance drop of 26.9 on 2 degrees of freedom (p < 0.001), and AIC falls from 628.4 to 605.6.
+2. Among the logistic models, it has the higher cross-validated AUC (0.869 versus 0.865) and accuracy (81.8% versus 80.3%).
+3. It remains fully interpretable. The random forest is nominally best, but its edge is within the noise and it cannot be explained as simply, so it is kept only as a benchmark. That it does not clearly beat logistic regression suggests the logistic model is not missing a lot of structure.
+
+## 3.4 Final model
+
+```{r final-fit}
+final_formula <- f2   # chosen from training-set evidence (Section 3.3)
+final_model <- glm(final_formula, data = train, family = binomial)
+summary(final_model)
+```
+
+Coefficients from logistic regression are on the log-odds scale, which is hard to read. Exponentiating them gives **odds ratios** (an odds ratio above 1 means higher odds of survival; below 1 means lower).
+
+```{r odds-ratios}
+or_tbl <- exp(cbind(OR = coef(final_model), confint(final_model)))
+round(or_tbl, 3)
+```
+
+**Reading the table.** Because the model includes a Sex x Class interaction, the `Sexmale` and `Pclass` rows describe the **reference group** (first-class women) and should not be read as overall effects. The effects that can be read directly are:
+
+- **Age:** each extra year multiplies the odds of survival by 0.95 (CI 0.93 to 0.97), about 42% lower odds per 10 years of age.
+- **Siblings/spouses (SibSp):** each additional one multiplies the odds by 0.65 (CI 0.49 to 0.83), about 35% lower.
+- **Recorded cabin:** multiplies the odds by 3.7 (CI 1.6 to 8.9), holding the other variables fixed.
+- **Port:** boarding at Southampton rather than Cherbourg multiplies the odds by 0.48 (CI 0.28 to 0.82). This agrees with Week 2 and shows the port gap persists even after accounting for class.
+- **Interaction:** being male lowered the odds of survival in every class, but the penalty is smaller, in odds terms, in third class than in first (interaction odds ratio 5.2, CI 1.5 to 25.4). The confidence intervals for the interaction terms are wide, so the exact size should be treated cautiously.
+- **Parch and Fare_log** are not statistically significant once the other variables are included. This does not mean fare is unimportant; it means fare adds little beyond class, cabin and family size, with which it overlaps.
+
+# 4. Model Evaluation on the Test Set
+
+The final model is now applied **once** to the 20% of passengers it has never seen.
+
+```{r test-eval}
+test$p <- predict(final_model, newdata = test, type = "response")
+test$pred <- factor(ifelse(test$p >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+cm <- table(Predicted = test$pred, Actual = test$Survived)
+cm
+
+tp <- cm["Yes", "Yes"]; tn <- cm["No", "No"]
+fp <- cm["Yes", "No"];  fn <- cm["No", "Yes"]
+
+acc_ci <- binom.test(tp + tn, sum(cm))
+roc_obj <- roc(test$Survived, test$p, levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+
+perf <- data.frame(
+  metric = c("Accuracy", "Accuracy 95% CI (low)", "Accuracy 95% CI (high)",
+             "Sensitivity (recall)", "Specificity", "Precision", "F1 score", "AUC",
+             "AUC 95% CI (low)", "AUC 95% CI (high)", "Baseline accuracy"),
+  value = round(c((tp + tn) / sum(cm), acc_ci$conf.int[1], acc_ci$conf.int[2],
+                  tp / (tp + fn), tn / (tn + fp), tp / (tp + fp),
+                  2 * tp / (2 * tp + fp + fn), as.numeric(auc(roc_obj)),
+                  ci.auc(roc_obj)[1], ci.auc(roc_obj)[3],
+                  max(prop.table(table(test$Survived)))), 3)
+)
+perf
+```
+
+**Reading the metrics.** *Sensitivity* is the share of actual survivors the model correctly identified; *specificity* is the share of actual non-survivors it correctly identified; *precision* is how often a "survived" prediction is right; *F1* balances precision and sensitivity; *AUC* is the probability that a randomly chosen survivor is given a higher predicted probability than a randomly chosen non-survivor (0.5 is guessing, 1.0 is perfect).
+
+**Interpretation.** On 178 unseen passengers the model classified **81.5%** correctly (95% CI 75.0% to 86.9%), well above the 61.8% achieved by always predicting "did not survive". The AUC of **0.850** (CI 0.787 to 0.914) means a randomly chosen survivor is ranked above a randomly chosen non-survivor 85% of the time. The cross-validated results on the training data (accuracy 81.8%, AUC 0.869) are close to these test figures, which suggests the model is not seriously overfitted.
+
+The model is better at recognising non-survivors (specificity 90.0%) than survivors (sensitivity 67.6%). Of the 68 actual survivors it missed 22, while only 11 of the 110 non-survivors were wrongly predicted to survive. When it predicts survival it is right 80.7% of the time. This asymmetry is partly a product of the 0.5 threshold, which favours the more common outcome; a lower threshold would catch more survivors at the cost of more false alarms (see Section 6).
+
+# 5. Model Diagnostics
+
+## 5.1 Confusion matrix and ROC curve
+
+```{r diag-cm-roc, fig.cap="Figure 2: Confusion matrix (left) and ROC curve (right) on the test set.", fig.height=3.6}
+cm_df <- as.data.frame(cm)
+p_cm <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = Freq), size = 6) +
+  scale_fill_gradient(low = "#F0F6FB", high = col_yes, guide = "none") +
+  labs(title = "Confusion matrix")
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_line(colour = col_yes, linewidth = 1) +
+  annotate("text", x = 0.65, y = 0.15, size = 4,
+           label = paste0("AUC = ", round(as.numeric(auc(roc_obj)), 3))) +
+  labs(title = "ROC curve", x = "False positive rate", y = "True positive rate")
+
+p_cm + p_roc
+```
+
+## 5.2 Calibration
+
+A well-calibrated model's predicted probabilities match reality: of the passengers given a 70% chance, about 70% should have survived. Predictions on the test set are grouped into five bins to check this.
+
+```{r diag-calib, fig.cap="Figure 3: Calibration plot on the test set (n = passengers per bin).", fig.height=3.6}
+calib <- test %>%
+  mutate(bin = ntile(p, 5)) %>%
+  group_by(bin) %>%
+  summarise(pred = mean(p), obs = mean(Survived == "Yes"), n = n(), .groups = "drop")
+calib
+
+ggplot(calib, aes(pred, obs)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_line(colour = col_yes) +
+  geom_point(colour = col_yes, size = 3) +
+  geom_text(aes(label = paste0("n=", n)), vjust = 1.8, size = 3) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Predicted vs observed survival",
+       x = "Mean predicted probability", y = "Observed survival rate")
+```
+
+## 5.3 Residual diagnostics
+
+For logistic regression, ordinary residual plots are hard to read because the outcome is 0 or 1. A **binned residual plot** groups passengers by fitted probability and plots the average residual per group; most points should fall within the approximate 95% bounds (dashed lines), with no systematic pattern.
+
+```{r diag-resid, fig.cap="Figure 4: Binned residual plot (training set).", fig.height=3.6}
+tr <- train
+tr$p   <- fitted(final_model)
+tr$res <- as.numeric(tr$Survived == "Yes") - tr$p
+
+binned <- tr %>%
+  mutate(bin = ntile(p, 25)) %>%
+  group_by(bin) %>%
+  summarise(mean_p = mean(p), mean_res = mean(res),
+            bound = 2 * sqrt(mean(p * (1 - p)) / n()), .groups = "drop")
+
+ggplot(binned, aes(mean_p, mean_res)) +
+  geom_hline(yintercept = 0, colour = "grey50") +
+  geom_line(aes(y = bound), linetype = "dashed", colour = col_no) +
+  geom_line(aes(y = -bound), linetype = "dashed", colour = col_no) +
+  geom_point(colour = col_yes, size = 2) +
+  labs(title = "Binned residuals vs fitted probability",
+       x = "Mean fitted probability", y = "Mean residual")
+
+mean(abs(binned$mean_res) > binned$bound)   # share of bins outside the bounds
+```
+
+## 5.4 Influential observations, multicollinearity and linearity
+
+```{r diag-cook, fig.cap="Figure 5: Cook's distance for each training observation (dashed line = 4/n).", fig.height=3.4}
+cd <- cooks.distance(final_model)
+cd_df <- data.frame(i = seq_along(cd), cooks = cd)
+
+ggplot(cd_df, aes(i, cooks)) +
+  geom_segment(aes(xend = i, yend = 0), colour = col_yes, alpha = 0.7) +
+  geom_hline(yintercept = 4 / length(cd), linetype = "dashed", colour = col_no) +
+  labs(title = "Cook's distance", x = "Observation index", y = "Cook's distance")
+
+c(n_above_4_over_n = sum(cd > 4 / length(cd)), max_cooks = round(max(cd), 3))
+```
+
+```{r diag-vif}
+# Multicollinearity is checked on the main-effects model
+# (VIF is not meaningful for terms involved in an interaction).
+vif(m1_tr)
+```
+
+```{r diag-linearity}
+# Linearity of Age on the log-odds scale: does adding Age^2 improve the fit?
+anova(final_model, update(final_model, . ~ . + I(Age^2)), test = "Chisq")
+```
+
+**Interpretation of the diagnostics**
+
+- **Confusion matrix and ROC.** The ROC curve rises steeply and stays well above the diagonal, confirming the model separates survivors from non-survivors much better than chance.
+- **Calibration.** Predictions broadly follow the diagonal. The largest gaps (predicted 5% versus observed 11% in the lowest bin, predicted 61% versus observed 49% in the fourth) look noticeable, but each bin holds only 35 to 36 passengers, so a gap of about 8 percentage points is within sampling noise.
+- **Binned residuals.** Three of the 25 bins (12%) fall outside the approximate 95% bounds, against about 5% expected by chance, and the two largest are positive residuals among passengers with low fitted probabilities. This means the model slightly under-predicts survival for some low-probability passengers, echoing the calibration plot. There is no strong curve or trend, so the fit is acceptable but not perfect.
+- **Influential observations.** The largest Cook's distance is 0.044, far below the conventional levels of concern (0.5 to 1). Forty-five points exceed the crude 4/n screening line, but none dominates, and no observation was removed.
+- **Multicollinearity.** The largest adjusted GVIF values are 1.74 (HasCabin), 1.67 (Fare_log) and 1.56 (Pclass), all below about 2. Class, fare and cabin do overlap, as expected, but not enough to destabilise the estimates.
+- **Linearity of age.** Adding an Age-squared term gives p = 0.053, borderline. There is no clear evidence of curvature, but a hint of it, which fits Week 2's finding that children did best and passengers in their 20s did worst.
+
+Overall, the main assumptions of logistic regression are reasonably met.
+
+# 6. Interpretation, Strengths and Improvements
+
+**Summary.** The final model, a logistic regression with a Sex x Class interaction, predicts survival with about 82% accuracy and an AUC of 0.85 on unseen data. It clearly beats the 62% majority-class baseline and performs about as well as a random forest benchmark, while remaining easy to explain.
+
+**Strengths**
+
+- **Generalises consistently.** Cross-validated and test performance are close (accuracy about 82%, AUC 0.85 to 0.87).
+- **Interpretable.** The odds ratios agree with the hypothesis tests (Section 2.2) and the Week 2 charts: being female, travelling with fewer siblings or a spouse, having a recorded cabin and boarding at Cherbourg all improve the odds. Age is a useful example of why modeling adds value: the simple test (Test 3) found no significant age difference, but once sex, class and the other variables are controlled, younger age clearly improves the odds.
+- **Sound diagnostics.** No influential points, only mild collinearity, and broadly reasonable calibration.
+- **Justified complexity.** The interaction term was added because the likelihood-ratio test and AIC supported it, not by default.
+
+**Weaknesses**
+
+- **Misses a third of survivors.** Sensitivity is 67.6%, so 22 of 68 survivors were predicted not to survive.
+- **Uncertain estimates.** With only 178 test passengers, the AUC interval is wide (0.79 to 0.91), so small differences between models cannot be trusted.
+- **Mild miscalibration.** Survival is slightly under-predicted among some low-probability passengers.
+- **Limited information.** The data lacks details such as where a passenger's cabin was or who travelled together, so there is a ceiling on what any model can learn from it.
+
+**Potential improvements**
+
+1. **Tune the decision threshold.** Choose it from out-of-fold predictions on the training data (not the test set) according to which error matters more, for example to raise sensitivity.
+2. **Model age more flexibly**, with splines or a child indicator, since the Age-squared test hinted at curvature.
+3. **Engineer richer features**, such as family or travel-group size from surnames and ticket numbers, and test them by cross-validation.
+4. **Try regularised or boosted models** (lasso, elastic net, gradient boosting) and compare them by cross-validation.
+5. **Make the pipeline stricter.** Impute missing ages inside each cross-validation fold, and use repeated splits or bootstrapping for narrower confidence intervals.
+6. **Recalibrate** the predicted probabilities (for example with isotonic regression) if they will be used as risk scores.
+
+# 7. Limitations
+
+- **Small sample.** With about 178 test passengers, test metrics have wide confidence intervals; a different random split could shift accuracy by several percentage points.
+- **Preprocessing before splitting.** Age imputation used medians from the full dataset. It used no outcome information, so bias is likely small, but a stricter pipeline would impute inside each cross-validation fold.
+- **Imputed ages.** About 20% of ages are estimates, which adds noise to any age effect.
+- **Association, not causation.** The model predicts; it does not prove why. Class, fare, cabin and sex are entangled.
+- **Single split for final evaluation.** Repeating the evaluation over many splits (or bootstrapping) would give a more stable estimate.
+- **Historical data.** Findings describe one event and should not be generalised.
+
+# Appendix: Session Information
+
+```{r session}
+sessionInfo()
+```
